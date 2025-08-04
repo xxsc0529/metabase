@@ -1,0 +1,16 @@
+{
+  "OceanBase Database": "OceanBase Database",
+  "OceanBase is a distributed relational database that supports both MySQL and Oracle compatibility modes. The driver will automatically detect the mode based on your database configuration.": "OceanBase is a distributed relational database that supports both MySQL and Oracle compatibility modes. The driver will automatically detect the mode based on your database configuration.",
+  "Key Features:": "Key Features:",
+  "Automatic MySQL/Oracle mode detection": "Automatic MySQL/Oracle mode detection",
+  "Full SQL compatibility with both modes": "Full SQL compatibility with both modes",
+  "Enterprise-grade performance and scalability": "Enterprise-grade performance and scalability",
+  "Built-in high availability and disaster recovery": "Built-in high availability and disaster recovery",
+  "OceanBase Compatibility Mode": "OceanBase Compatibility Mode",
+  "OceanBase supports both MySQL and Oracle compatibility modes. The driver will automatically detect the mode, but you can specify it here if needed.": "OceanBase supports both MySQL and Oracle compatibility modes. The driver will automatically detect the mode, but you can specify it here if needed.",
+  "Auto-detect": "Auto-detect",
+  "MySQL Mode": "MySQL Mode",
+  "Oracle Mode": "Oracle Mode",
+  "Connection Information": "Connection Information",
+  "OceanBase typically runs on port 2883. The driver will automatically detect whether your database is in MySQL or Oracle compatibility mode.": "OceanBase typically runs on port 2883. The driver will automatically detect whether your database is in MySQL or Oracle compatibility mode."
+}

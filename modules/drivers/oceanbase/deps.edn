@@ -1,0 +1,14 @@
+{:paths
+ ["src" "resources"]
+
+ :deps
+ {;; OceanBase unified JDBC driver (supports both MySQL and Oracle mode)
+  com.oceanbase/oceanbase-client {:mvn/version "2.4.14"}}
+
+ :aliases
+ {:oss
+  {:replace-deps {com.oceanbase/oceanbase-client {:mvn/version "2.4.14"}}
+   :replace-paths ["src" "resources"]}
+
+  :ee
+  {}}}

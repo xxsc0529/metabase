@@ -488,6 +488,7 @@
     "h2"
     "mongo"
     "mysql"
+    "oceanbase"
     "oracle"
     "postgres"
     "presto-jdbc"
