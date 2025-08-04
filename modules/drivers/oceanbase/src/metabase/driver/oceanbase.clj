@@ -6,31 +6,31 @@
    [metabase.driver :as driver]
    [metabase.driver.common :as driver.common]
    [metabase.driver.sql-jdbc.connection :as sql-jdbc.conn]
+   [metabase.driver.sql-jdbc.execute :as sql-jdbc.execute]
    [metabase.driver.sql-jdbc.sync :as sql-jdbc.sync]
    [metabase.driver.sql-jdbc.sync.common :as sql-jdbc.sync.common]
+   [metabase.driver.sql-jdbc.sync.describe-table :as sql-jdbc.describe-table]
+   [metabase.driver.sql-jdbc.sync.describe-database :as sql-jdbc.describe-database]
+   [metabase.driver.sql-jdbc.sync.interface :as sql-jdbc.sync.interface]
    [metabase.driver.sql-jdbc.common :as sql-jdbc.common]
    [metabase.driver-api.core :as driver-api]
    [clojure.set :as set]
-   [metabase.driver.sql-jdbc.sync.describe-table :as sql-jdbc.describe-table]
-   [metabase.driver.sql-jdbc.sync.interface :as sql-jdbc.sync.interface]
    [metabase.driver.sql.query-processor :as sql.qp]
    [metabase.driver.sql.query-processor.empty-string-is-null :as sql.qp.empty-string-is-null]
+   [metabase.driver.sql.util :as sql.u]
    [metabase.util :as u]
    [metabase.util.honey-sql-2 :as h2x]
    [metabase.util.log :as log]
-   [metabase.util.malli :as mu]
-   [metabase.util.malli.registry :as mr])
-  (:import [java.sql
-            Connection
-            DatabaseMetaData
-            ResultSet]))
+   [metabase.util.malli.registry :as mr]
+   [honey.sql.helpers :as sql.helpers])
+  (:import [java.sql Connection DatabaseMetaData ResultSet]))
 
 (set! *warn-on-reflection* true)
 
 (driver/register! :oceanbase, :parent #{:sql-jdbc
                                         ::sql.qp.empty-string-is-null/empty-string-is-null})
 
-(defmethod metabase.app-db.spec/spec :oceanbase
+(defmethod driver-api/spec :oceanbase
   [_ {:keys [host port db]
       :or   {host "localhost", port 2881, db ""}
       :as   opts}]
@@ -41,165 +41,144 @@
    (dissoc opts :host :port :db)))
 
 (def supported-features
-  {:datetime-diff           true
-                              :expression-literals     true
-                              :now                     true
-                              :identifiers-with-spaces true
-                              :convert-timezone        true
-                              :expressions/date        true
-                              :describe-fields         true
-   :database-routing        false})
+  {:datetime-diff true
+   :expression-literals true
+   :now true
+   :identifiers-with-spaces true
+   :convert-timezone true
+   :expressions/date true
+   :describe-fields true
+   :database-routing false})
 
 (doseq [[feature supported?] supported-features]
   (defmethod driver/database-supports? [:oceanbase feature] [_driver _feature _db] supported?))
 
-(def ^:private mode-cache (atom {}))
-
-(defn- get-connection-key [spec]
-  (str (:host spec) ":" (:port spec) "/" (:dbname spec)))
+(defn- get-oceanbase-mode
+  "Get OceanBase compatibility mode from connection or spec.
+   Returns 'oracle' or 'mysql'. Defaults to 'oracle' if detection fails."
+  [conn-or-spec]
+  (try
+    (let [query "SHOW VARIABLES LIKE 'ob_compatibility_mode'"
+          result (jdbc/query conn-or-spec [query] {:as-arrays? false :max-rows 1})]
+      (if (seq result)
+        (let [value (get-in (first result) [:value])]
+          (if (= value "ORACLE") "oracle" "mysql"))
+        "oracle"))
+    (catch Exception e
+      (log/error "Failed to detect OceanBase mode, defaulting to oracle. Error:" (.getMessage e))
+      "oracle")))
 
 (defn- get-mode [spec]
-  (let [conn-key (get-connection-key spec)]
-    (if-let [cached-mode (@mode-cache conn-key)]
-      cached-mode
-      (try
-        (let [query "SELECT @@ob_compatibility_mode as mode"
-              result (jdbc/query spec [query] {:as-arrays? false :max-rows 1})
-              mode (if (seq result)
-                     (let [value (str/lower-case (get-in (first result) [:mode]))]
-                       (if (str/includes? value "oracle") "oracle" "mysql"))
-                     "mysql")]
-          (swap! mode-cache assoc conn-key mode)
-          (log/debug "Detected OceanBase mode:" mode "for connection:" conn-key)
-          mode)
-        (catch Exception e
-          (log/warn "Failed to detect OceanBase mode, defaulting to mysql. Error:" (.getMessage e))
-          (swap! mode-cache assoc conn-key "mysql")
-          "mysql")))))
+  (get-oceanbase-mode spec))
 
-(defn- clear-mode-cache! []
-  "Clear the OceanBase mode cache. Useful for testing or when connection details change."
-  (reset! mode-cache {}))
-
-
+(defn- detect-mode-from-connection [conn]
+  (get-oceanbase-mode {:connection conn}))
 
 (def ^:private database-type->base-type
   (sql-jdbc.sync/pattern-based-database-type->base-type
-   [;; MySQL mode types
-    [#"BIGINT"      :type/BigInteger]
-    [#"BINARY"      :type/*]
-    [#"BIT"         :type/Boolean]
-    [#"BLOB"        :type/*]
-    [#"CHAR"        :type/Text]
-    [#"DATE"        :type/Date]
-    [#"DATETIME"    :type/DateTime]
-    [#"DECIMAL"     :type/Decimal]
-    [#"DOUBLE"      :type/Float]
-    [#"ENUM"        :type/Text]
-    [#"FLOAT"       :type/Float]
-    [#"INT"         :type/Integer]
-    [#"INTEGER"     :type/Integer]
-    [#"JSON"        :type/JSON]
-    [#"LONGBLOB"    :type/*]
-    [#"LONGTEXT"    :type/Text]
-    [#"MEDIUMBLOB"  :type/*]
-    [#"MEDIUMINT"   :type/Integer]
-    [#"MEDIUMTEXT"  :type/Text]
-    [#"NUMERIC"     :type/Decimal]
-    [#"REAL"        :type/Float]
-    [#"SET"         :type/Text]
-    [#"SMALLINT"    :type/Integer]
-    [#"TEXT"        :type/Text]
-    [#"TIME"        :type/Time]
-    [#"TIMESTAMP"   :type/DateTime]
-    [#"TINYBLOB"    :type/*]
-    [#"TINYINT"     :type/Integer]
-    [#"TINYTEXT"    :type/Text]
-    [#"VARBINARY"   :type/*]
-    [#"VARCHAR"     :type/Text]
-    [#"YEAR"        :type/Integer]
-    ;; Oracle mode types
-    [#"ANYDATA"     :type/*]
-    [#"ANYTYPE"     :type/*]
-    [#"ARRAY"       :type/*]
-    [#"BFILE"       :type/*]
-    [#"BLOB"        :type/*]
-    [#"CLOB"        :type/Text]
-    [#"DATE"        :type/DateTime]
-    [#"DOUBLE"      :type/Float]
-    [#"FLOAT"       :type/Float]
-    [#"INTERVAL"    :type/DateTime]
-    [#"LONG RAW"    :type/*]
-    [#"LONG"        :type/Text]
-    [#"NUMBER"      :type/Decimal]
-    [#"RAW"         :type/*]
-    [#"REAL"        :type/Float]
-    [#"REF"         :type/*]
-    [#"ROWID"       :type/*]
-    [#"STRUCT"      :type/*]
-    [#"TIMESTAMP(\(\d\))? WITH TIME ZONE"       :type/DateTimeWithTZ]
+   [[#"BIGINT" :type/BigInteger]
+    [#"BINARY" :type/*]
+    [#"BIT" :type/Boolean]
+    [#"BLOB" :type/*]
+    [#"CHAR" :type/Text]
+    [#"DATE" :type/Date]
+    [#"DATETIME" :type/DateTime]
+    [#"DECIMAL" :type/Decimal]
+    [#"DOUBLE" :type/Float]
+    [#"ENUM" :type/Text]
+    [#"FLOAT" :type/Float]
+    [#"INT" :type/Integer]
+    [#"INTEGER" :type/Integer]
+    [#"JSON" :type/JSON]
+    [#"LONGBLOB" :type/*]
+    [#"LONGTEXT" :type/Text]
+    [#"MEDIUMBLOB" :type/*]
+    [#"MEDIUMINT" :type/Integer]
+    [#"MEDIUMTEXT" :type/Text]
+    [#"NUMERIC" :type/Decimal]
+    [#"REAL" :type/Float]
+    [#"SET" :type/Text]
+    [#"SMALLINT" :type/Integer]
+    [#"TEXT" :type/Text]
+    [#"TIME" :type/Time]
+    [#"TIMESTAMP" :type/DateTime]
+    [#"TINYBLOB" :type/*]
+    [#"TINYINT" :type/Integer]
+    [#"TINYTEXT" :type/Text]
+    [#"VARBINARY" :type/*]
+    [#"VARCHAR" :type/Text]
+    [#"YEAR" :type/Integer]
+    [#"ANYDATA" :type/*]
+    [#"ANYTYPE" :type/*]
+    [#"ARRAY" :type/*]
+    [#"BFILE" :type/*]
+    [#"CLOB" :type/Text]
+    [#"INTERVAL" :type/DateTime]
+    [#"LONG RAW" :type/*]
+    [#"LONG" :type/Text]
+    [#"NUMBER" :type/Decimal]
+    [#"RAW" :type/*]
+    [#"REF" :type/*]
+    [#"ROWID" :type/*]
+    [#"STRUCT" :type/*]
+    [#"TIMESTAMP(\(\d\))? WITH TIME ZONE" :type/DateTimeWithTZ]
     [#"TIMESTAMP(\(\d\))? WITH LOCAL TIME ZONE" :type/DateTimeWithLocalTZ]
-    [#"TIMESTAMP"   :type/DateTime]
-    [#"VARCHAR2"    :type/Text]
-    [#"XML"         :type/*]]))
+    [#"VARCHAR2" :type/Text]
+    [#"XML" :type/*]]))
 
 (defmethod sql-jdbc.sync/database-type->base-type :oceanbase
   [_ column-type]
   (database-type->base-type column-type))
 
-
-
 (defmethod sql.qp/quote-style :oceanbase
   [driver]
-  :oracle)
+  (try
+    (let [spec (sql-jdbc.conn/connection-details->spec driver {})
+          mode (get-mode spec)]
+      (case (clojure.string/lower-case mode)
+        "mysql" :mysql
+        :oracle))
+    (catch Exception e
+      (log/warn "Error determining OceanBase quote-style, defaulting to oracle. Error:" (.getMessage e))
+      :oracle)))
 
 (defmethod driver/db-start-of-week :oceanbase
   [_driver]
   :sunday)
 
 (mr/def ::details
-  "OceanBase database details map."
   [:map
-   [:use-connection-uri            {:optional true} [:maybe boolean?]]
-   [:connection-uri                {:optional true} [:maybe string?]]
-   [:host                          {:optional true} [:maybe string?]]
-   [:port                          {:optional true} [:maybe integer?]]
-   [:user                          {:optional true} [:maybe string?]]
-   [:password                      {:optional true} [:maybe string?]]
-   [:db                            {:optional true} [:maybe string?]]
-   [:schema-filters-type           {:optional true} [:enum "inclusion" "exclusion"]]
-   [:schema-filters-patterns       {:optional true} [:maybe string?]]
-   [:ssl                           {:optional true} [:maybe boolean?]]])
+   [:host {:optional true} [:maybe string?]]
+   [:port {:optional true} [:maybe integer?]]
+   [:user {:optional true} [:maybe string?]]
+   [:password {:optional true} [:maybe string?]]
+   [:db {:optional true} [:maybe string?]]
+   [:schema-filters-type {:optional true} [:enum "inclusion" "exclusion"]]
+   [:schema-filters-patterns {:optional true} [:maybe string?]]])
 
 (def ^:private default-connection-args
-  "Map of args for the OceanBase JDBC connection string."
-  {:useUnicode           true
-   :characterEncoding    "UTF-8"
-   :autoReconnect        true
-   :failOverReadOnly     false
-   :maxReconnects        3
-   :initialTimeout       2
-   :connectTimeout       30000
-   :socketTimeout        30000
-   :serverTimezone       "UTC"
+  {:useUnicode true
+   :characterEncoding "UTF-8"
+   :autoReconnect true
+   :failOverReadOnly false
+   :maxReconnects 3
+   :initialTimeout 2
+   :connectTimeout 30000
+   :socketTimeout 30000
+   :serverTimezone "UTC"
    :allowPublicKeyRetrieval true
-   :useSSL               false
-   :requireSSL           false
-   :verifyServerCertificate false
-   :trustServerCertificate false
-   :useProxy             false
-   :proxyHost            ""
-   :proxyPort            ""
-   :proxyUser            ""
-   :proxyPassword        ""
-   :autoCommit           true
-   :readOnly             false
+   :useProxy false
+   :proxyHost ""
+   :proxyPort ""
+   :proxyUser ""
+   :proxyPassword ""
+   :autoCommit true
+   :readOnly false
    :transactionIsolation "READ_COMMITTED"})
 
 (defn- maybe-add-program-name-option [jdbc-spec additional-options-map]
-  (let [set-prog-nm-fn (fn []
-                         (let [prog-name (str/replace driver-api/mb-version-and-process-identifier "," "_")]
-                           (assoc jdbc-spec :connectionAttributes (str "program_name:" prog-name))))]
+  (let [prog-name (str/replace driver-api/mb-version-and-process-identifier "," "_")
+        set-prog-nm-fn #(assoc jdbc-spec :connectionAttributes (str "program_name:" prog-name))]
     (if-let [conn-attrs (get additional-options-map "connectionAttributes")]
       (if (str/includes? conn-attrs "program_name")
         jdbc-spec
@@ -207,55 +186,43 @@
       (set-prog-nm-fn))))
 
 (defmethod sql-jdbc.conn/connection-details->spec :oceanbase
-  [_ {ssl? :ssl, :keys [additional-options ssl-cert host port user password db connection-uri use-connection-uri], :as details}]
-  (let [addl-opts-map (sql-jdbc.common/additional-options->map additional-options :url "=" false)
-        ;; Disable SSL by default unless explicitly set by user
-        ssl?          (and ssl? (not= ssl? false))
-        ssl-cert?     (and ssl? (some? ssl-cert))]
-    (if (and use-connection-uri connection-uri)
-      ;; If use-connection-uri is true and a complete JDBC URL is provided, use it directly
-      (do
-        (log/debug "OceanBase connection - Using provided JDBC URL:" (str/replace connection-uri password "***"))
-        {:connection-uri connection-uri})
-      ;; Otherwise build the JDBC URL
-      (let [;; Ensure user and password are not nil
-            user          (or user "")
-            password      (or password "")
-            ;; Build JDBC URL using OceanBase driver with proxy disabled settings
-            jdbc-url (str "jdbc:oceanbase://" (or host "localhost") ":" (or port 2881) "/" (or db "")
-                          "?user=" user
-                          "&password=" password
-                          "&useUnicode=true"
-                          "&characterEncoding=UTF-8"
-                          "&autoReconnect=true"
-                          "&failOverReadOnly=false"
-                          "&maxReconnects=3"
-                          "&initialTimeout=2"
-                          "&connectTimeout=30000"
-                          "&socketTimeout=30000"
-                          "&serverTimezone=UTC"
-                          "&allowPublicKeyRetrieval=true"
-                          "&useSSL=false"
-                          "&requireSSL=false"
-                          "&verifyServerCertificate=false"
-                          "&trustServerCertificate=false"
-                          "&useProxy=false"
-                          "&proxyHost="
-                          "&proxyPort="
-                          "&proxyUser="
-                          "&proxyPassword="
-                          "&autoCommit=true"
-                          "&readOnly=false"
-                          "&transactionIsolation=READ_COMMITTED")]
-        (log/debug "OceanBase connection - JDBC URL:" (str/replace jdbc-url password "***"))
-        {:connection-uri jdbc-url}))))
+  [_ {:keys [additional-options], :as details}]
+  (let [addl-opts-map (sql-jdbc.common/additional-options->map additional-options :url "=" false)]
+    (merge
+     default-connection-args
+     (let [details (-> details (set/rename-keys {:dbname :db}))]
+       (-> (driver-api/spec :oceanbase details)
+           (maybe-add-program-name-option addl-opts-map)
+           (sql-jdbc.common/handle-additional-options details))))))
+
+(defmethod driver/connection-properties :oceanbase
+  [_]
+  (->>
+   [driver.common/default-host-details
+    (assoc driver.common/default-port-details :placeholder 2881)
+    driver.common/default-dbname-details
+    driver.common/default-user-details
+    driver.common/default-password-details
+    driver.common/default-role-details
+    driver.common/advanced-options-start
+    (assoc driver.common/additional-options
+           :placeholder  "useUnicode=true&characterEncoding=UTF-8&autoReconnect=true")
+    driver.common/default-advanced-options]
+   (into [] (mapcat u/one-or-many))))
 
 (defmethod driver/can-connect? :oceanbase
   [driver details]
   (try
     (let [spec (sql-jdbc.conn/connection-details->spec driver details)]
       (log/debug "Testing OceanBase connection with spec:" (dissoc spec :password))
-      (sql-jdbc.conn/can-connect-with-spec? spec))
+      ;; Use SHOW VARIABLES query - works in both MySQL and Oracle modes
+      (let [result (jdbc/query spec ["SHOW VARIABLES LIKE 'ob_compatibility_mode'"])
+            first-row (first result)
+            value (get-in first-row [:value])]
+        (log/debug "OceanBase connection test result:" {:result result :first-row first-row :value value})
+        (and (some? value)
+             (or (= value "MYSQL")
+                 (= value "ORACLE")))))
     (catch Exception e
       (log/error e "Failed to connect to OceanBase database")
       false)))
@@ -264,8 +231,7 @@
   (let [[x-sql & x-args] (sql/format-expr x {:nested true})
         [y-sql & y-args] (sql/format-expr y {:nested true})]
     (into [(format "mod(%s, %s)" x-sql y-sql)]
-          cat
-          [x-args y-args])))
+          (concat x-args y-args))))
 
 (sql/register-fn! ::mod #'format-mod)
 
@@ -276,9 +242,10 @@
 
 (defmethod sql.qp/->honeysql [:oceanbase :substring]
   [driver [_ arg start & [length]]]
+  ;; Default to Oracle mode (SUBSTR) since it's more restrictive
   (if length
-    [:substring (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver start) (sql.qp/->honeysql driver length)]
-    [:substring (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver start)]))
+    [:substr (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver start) (sql.qp/->honeysql driver length)]
+    [:substr (sql.qp/->honeysql driver arg) (sql.qp/->honeysql driver start)]))
 
 (defmethod sql.qp/->honeysql [:oceanbase :concat]
   [driver [_ & args]]
@@ -356,16 +323,19 @@
 
 (defmethod driver/humanize-connection-error-message :oceanbase
   [_ message]
-  (cond
-    (str/includes? message "Connection refused")
-    "Unable to connect to OceanBase. Please check your host, port, and ensure the database is running."
-    (str/includes? message "Access denied")
-    "Invalid username or password. Please check your credentials."
-    (str/includes? message "Unknown database")
-    "Database not found. Please check your database name."
-    (str/includes? message "(or sid service-name)")
-    "You must specify the SID and/or the Service Name."
-    :else
+  (condp re-matches message
+    #"^Communications link failure\s+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.$"
+    :cannot-connect-check-host-and-port
+
+    #"^Unknown database .*$"
+    :database-name-incorrect
+
+    #"Access denied for user.*$"
+    :username-or-password-incorrect
+
+    #"Must specify port after ':' in connection string"
+    :invalid-hostname
+
     message))
 
 (defmethod sql-jdbc.sync/excluded-schemas :oceanbase
@@ -383,114 +353,293 @@
 (defmethod sql-jdbc.describe-table/get-table-pks :oceanbase
   [_driver ^Connection conn _db-name-or-nil table]
   (let [^DatabaseMetaData metadata (.getMetaData conn)]
-    (into [] (sql-jdbc.sync.common/reducible-results
-              #(.getPrimaryKeys metadata nil nil (:name table))
-              (fn [^ResultSet rs] #(.getString rs "COLUMN_NAME"))))))
+    (try
+      (into [] (sql-jdbc.sync.common/reducible-results
+                #(.getPrimaryKeys metadata nil nil (:name table))
+                (fn [^ResultSet rs] #(.getString rs "COLUMN_NAME"))))
+      (catch Exception e
+        (log/warn "Error getting primary keys for table" (:name table) "Error:" (.getMessage e))
+        []))))
 
-(defmethod sql-jdbc.sync.interface/filtered-syncable-schemas :oceanbase
-  [_driver conn _metadata _schema-inclusion-filters _schema-exclusion-filters]
+(defn- filtered-syncable-schemas-impl
+  [_driver conn]
   (try
-    (let [test-spec {:connection conn}
-          mode-query "SELECT @@ob_compatibility_mode as mode"
-          mode-result (jdbc/query test-spec [mode-query] {:as-arrays? false :max-rows 1})
-          mode (if (seq mode-result)
-                 (let [value (str/lower-case (get-in (first mode-result) [:mode]))]
-                   (if (str/includes? value "oracle") "oracle" "mysql"))
-                 "mysql")]
-      (log/debug "OceanBase schema filtering - detected mode:" mode)
+    (let [mode (clojure.string/lower-case (detect-mode-from-connection conn))]
+      (log/info "OceanBase schema filtering - detected mode:" mode)
       (case mode
         "oracle"
-        (let [user-query "SELECT USER as user FROM DUAL"
-              user-result (jdbc/query test-spec [user-query] {:as-arrays? false :max-rows 1})
+        (try
+          (let [test-spec {:connection conn}
+                user-query "SELECT USER FROM DUAL"
+                user-result (jdbc/query test-spec [user-query] {:as-arrays? false :max-rows 1})
                 current-user (when (seq user-result)
                               (get-in (first user-result) [:user]))]
+            (log/info "OceanBase Oracle mode: user query result:" {:user-result user-result :current-user current-user})
             (if current-user
-                  [current-user]
-                  []))
+              [current-user]
+              (do
+                (log/warn "OceanBase Oracle mode: No valid username found from SQL query, returning empty schema list")
+                [])))
+          (catch Exception e
+            (log/warn "OceanBase Oracle mode: Failed to get username from SQL query, returning empty schema list. Error:" (.getMessage e))
+            []))
         "mysql"
-        []
+        (try
+          (let [test-spec {:connection conn}
+                db-query "SELECT DATABASE() as current_db"
+                db-result (jdbc/query test-spec [db-query] {:as-arrays? false :max-rows 1})
+                current-db (when (seq db-result)
+                            (get-in (first db-result) [:current_db]))]
+            (log/info "OceanBase MySQL mode: database query result:" {:db-result db-result :current-db current-db})
+            (if current-db
+              [current-db]
+              (do
+                (log/warn "OceanBase MySQL mode: No valid database found from SQL query, returning empty schema list")
+                [])))
+          (catch Exception e
+            (log/warn "OceanBase MySQL mode: Failed to get database from SQL query, returning empty schema list. Error:" (.getMessage e))
+            []))
         []))
     (catch Exception e
       (log/warn "Error in OceanBase schema filtering, returning empty list. Error:" (.getMessage e))
       [])))
 
-(defn- build-oracle-sql [table-names]
-  (let [base-sql "SELECT c.column_name as name,
-                         c.column_id - 1 as database_position,
-                         c.table_name as table_name,
-                         UPPER(c.data_type) as database_type,
-                         CASE WHEN c.nullable = 'Y' THEN 'false' ELSE 'true' END as database_required,
-                         'false' as database_is_auto_increment,
-                         CASE WHEN pk.column_name IS NOT NULL THEN 'true' ELSE 'false' END as pk_field,
-                         cc.comments as field_comment
-                  FROM user_tab_columns c
-                  LEFT JOIN user_col_comments cc ON (c.table_name = cc.table_name AND c.column_name = cc.column_name)
-                  LEFT JOIN (
-                    SELECT pcc.table_name, pcc.column_name
-                    FROM user_cons_columns pcc
-                    JOIN user_constraints puc ON (pcc.constraint_name = puc.constraint_name)
-                    WHERE puc.constraint_type = 'P'
-                  ) pk ON (c.table_name = pk.table_name AND c.column_name = pk.column_name)"
-        where-clause (when (seq table-names)
-                       (str " WHERE LOWER(c.table_name) IN ("
-                            (clojure.string/join "," (map #(str "'" % "'") (map u/lower-case-en table-names)))
-                            ")"))
-        final-sql (str base-sql where-clause " ORDER BY c.table_name, c.column_id")]
-    [final-sql]))
+(defmethod sql-jdbc.sync.interface/filtered-syncable-schemas :oceanbase
+  [_driver conn _metadata _schema-inclusion-filters _schema-exclusion-filters]
+  (filtered-syncable-schemas-impl _driver conn))
 
-(defn- build-mysql-sql [table-names db-name]
-  (let [base-sql "SELECT c.column_name AS name,
-                         c.ordinal_position - 1 AS database_position,
-                         c.table_name AS table_name,
-                         UPPER(c.data_type) AS database_type,
-                         CASE WHEN c.is_nullable = 'NO' AND c.extra != 'auto_increment' THEN 'true' ELSE 'false' END AS database_required,
-                         CASE WHEN c.extra = 'auto_increment' THEN 'true' ELSE 'false' END AS database_is_auto_increment,
-                         CASE WHEN c.column_key = 'PRI' THEN 'true' ELSE 'false' END AS pk_field,
-                         c.column_comment AS field_comment
-                  FROM information_schema.columns c
-                  WHERE c.table_schema = ?"
-        where-clause (when (seq table-names)
-                       (str " AND LOWER(c.table_name) IN ("
-                            (clojure.string/join "," (map #(str "'" % "'") (map u/lower-case-en table-names)))
-                            ")"))
-        final-sql (str base-sql where-clause " ORDER BY c.table_name, c.ordinal_position")]
-    [final-sql db-name]))
+(defmethod sql-jdbc.sync.interface/active-tables :oceanbase
+  [driver connection schema-inclusion-filters schema-exclusion-filters]
+  (sql-jdbc.describe-database/fast-active-tables driver connection nil schema-inclusion-filters schema-exclusion-filters))
+
+
+
+(defmethod driver/describe-database :oceanbase
+  [driver database]
+  (sql-jdbc.execute/do-with-connection-with-options
+   driver
+   database
+   nil
+   (fn [^Connection conn]
+     (let [mode (get-mode (sql-jdbc.conn/connection-details->spec driver (:details database)))
+           db-name (or (:dbname (:details database)) (:db (:details database)))]
+       (log/debug "OceanBase describe database - mode:" mode "db-name:" db-name)
+       (case (clojure.string/lower-case mode)
+         "oracle"
+         (let [sql "SELECT t.table_name as name,
+                           USER as schema,
+                           tc.comments as description
+                    FROM user_tables t
+                    LEFT JOIN user_tab_comments tc ON (t.table_name = tc.table_name)
+                    WHERE tc.table_type = 'TABLE' OR tc.table_type IS NULL
+                    ORDER BY t.table_name"
+               tables (jdbc/query {:connection conn} [sql])]
+           {:tables (set (map (fn [table]
+                               {:name (:name table)
+                                :schema (:schema table)
+                                :description (when-not (str/blank? (:description table))
+                                              (:description table))})
+                             tables))})
+         "mysql"
+         (let [sql "SELECT t.table_name as name,
+                           t.table_schema as `schema`,
+                           t.table_comment as description
+                    FROM information_schema.tables t
+                    WHERE t.table_schema = ? AND t.table_type = 'BASE TABLE'
+                    ORDER BY t.table_name"
+               tables (jdbc/query {:connection conn} [sql db-name])]
+           {:tables (set (map (fn [table]
+                               {:name (:name table)
+                                :schema (:schema table)
+                                :description (when-not (str/blank? (:description table))
+                                              (:description table))})
+                             tables))})
+         (let [sql "SELECT t.table_name as name,
+                           USER as schema,
+                           tc.comments as description
+                    FROM user_tables t
+                    LEFT JOIN user_tab_comments tc ON (t.table_name = tc.table_name)
+                    WHERE tc.table_type = 'TABLE' OR tc.table_type IS NULL
+                    ORDER BY t.table_name"
+               tables (jdbc/query {:connection conn} [sql])]
+           {:tables (set (map (fn [table]
+                               {:name (:name table)
+                                :schema (:schema table)
+                                :description (when-not (str/blank? (:description table))
+                                              (:description table))})
+                             tables))}))))))
 
 (defmethod sql-jdbc.sync/describe-fields-sql :oceanbase
   [driver & {:keys [table-names details]}]
-  (try
-    (let [spec (sql-jdbc.conn/connection-details->spec driver details)
-          mode (get-mode spec)
-          db-name (:dbname spec)]
-      (log/debug "OceanBase describe fields - mode:" mode "db-name:" db-name)
-    (case mode
-        "oracle" (build-oracle-sql table-names)
-        "mysql"  (build-mysql-sql table-names db-name)
-        (build-oracle-sql table-names)))
-    (catch Exception e
-      (log/error e "Error in OceanBase describe-fields-sql, falling back to Oracle mode")
-      (build-oracle-sql table-names))))
+  (letfn [(build-table-filter [tables]
+            (when (seq tables)
+              (str " IN (" (clojure.string/join "," (map #(str "'" (clojure.string/lower-case %) "'") tables)) ")")))
+
+          (build-oracle-sql [tables]
+            (str "SELECT c.column_name as name,
+                       c.column_id as database_position,
+                       c.table_name as table_name,
+                       UPPER(c.data_type) as database_type,
+                       CASE WHEN c.nullable = 'Y' THEN 0 ELSE 1 END as database_required,
+                       0 as database_is_auto_increment,
+                       CASE WHEN pk.column_name IS NOT NULL THEN 1 ELSE 0 END as pk_field,
+                       cc.comments as field_comment
+                FROM user_tab_columns c
+                LEFT JOIN user_col_comments cc ON (c.table_name = cc.table_name AND c.column_name = cc.column_name)
+                LEFT JOIN (
+                  SELECT pcc.table_name, pcc.column_name
+                  FROM user_cons_columns pcc
+                  JOIN user_constraints puc ON (pcc.constraint_name = puc.constraint_name)
+                  WHERE puc.constraint_type = 'P'
+                ) pk ON (c.table_name = pk.table_name AND c.column_name = pk.column_name)"
+                 (when (seq tables) (str " WHERE LOWER(c.table_name)" (build-table-filter tables)))
+                 " ORDER BY c.table_name, c.column_id"))
+
+          (build-mysql-sql [tables db-name]
+            (let [base-sql "SELECT c.column_name AS name,
+                                   c.ordinal_position AS database_position,
+                                   c.table_name AS table_name,
+                                   UPPER(c.data_type) AS database_type,
+                                   CASE WHEN c.is_nullable = 'NO' AND c.extra != 'auto_increment' THEN 1 ELSE 0 END AS database_required,
+                                   CASE WHEN c.extra = 'auto_increment' THEN 1 ELSE 0 END AS database_is_auto_increment,
+                                   CASE WHEN c.column_key = 'PRI' THEN 1 ELSE 0 END AS pk_field,
+                                   c.column_comment AS field_comment
+                            FROM information_schema.columns c"
+                  table-filter (when (seq tables) (str " AND LOWER(c.table_name)" (build-table-filter tables)))
+                  final-sql (str base-sql
+                                (if (and db-name (not (str/blank? db-name)))
+                                  " WHERE c.table_schema = ?"
+                                  " WHERE c.table_schema = (SELECT DATABASE())")
+                                table-filter
+                                " ORDER BY c.table_name, c.ordinal_position")]
+              (if (and db-name (not (str/blank? db-name)))
+                [final-sql db-name]
+                [final-sql])))]
+    (try
+      (let [spec (sql-jdbc.conn/connection-details->spec driver details)
+            mode (get-mode spec)
+            db-name (or (:dbname spec) (:db spec))]
+        (case (clojure.string/lower-case mode)
+          "mysql" (build-mysql-sql table-names db-name)
+          [(build-oracle-sql table-names)]))
+      (catch Exception e
+        (log/error e "Error in OceanBase describe-fields-sql, falling back to Oracle mode")
+        [(build-oracle-sql table-names)]))))
+
+
 
 (defmethod sql-jdbc.sync/describe-fields-pre-process-xf :oceanbase
   [_driver _db & _args]
-  (map (fn [col]
-         (try
-           (-> col
-               (assoc :database-type (:database_type col))
-               (assoc :database-position (:database_position col))
-               (assoc :table-name (:table_name col))
-               (assoc :database-required (= (:database_required col) "true"))
-               (assoc :database-is-auto-increment (= (:database_is_auto_increment col) "true"))
-               (assoc :pk? (= (:pk_field col) "true"))
-               (assoc :field-comment (when-not (str/blank? (:field_comment col)) (:field_comment col)))
-               (assoc :description (or (:field_comment col) ""))
-               (dissoc :pk_field :database_type :database_position :table_name :field_comment :database_required :database_is_auto_increment))
-      (catch Exception e
-             (log/warn "Error processing field column:" col "Error:" (.getMessage e))
-             col)))))
+  (letfn [(parse-position [pos-val]
+            (when pos-val
+              (try
+                (-> (if (number? pos-val) pos-val (Integer/parseInt (str pos-val))) dec)
+                (catch Exception _
+                  (log/warn "Failed to parse database_position:" pos-val)
+                  nil))))
+
+          (is-true? [val]
+            (or (= val 1) (= val 1M)))]
+    (map (fn [col]
+           (try
+             (-> col
+                 (assoc :table-name (:table_name col))
+                 (assoc :database-type (:database_type col))
+                 (cond-> (and (:field_comment col) (not (str/blank? (:field_comment col))))
+                   (assoc :field-comment (:field_comment col)))
+                 (assoc :pk? (is-true? (:pk_field col)))
+                 (assoc :database-required (is-true? (:database_required col)))
+                 (assoc :database-is-auto-increment (is-true? (:database_is_auto_increment col)))
+                 (assoc :database-position (parse-position (:database_position col)))
+                 (dissoc :table_name :database_type :field_comment :pk_field :database_required :database_is_auto_increment))
+             (catch Exception e
+               (log/warn "Error processing field column:" col "Error:" (.getMessage e))
+               col))))))
 
 (defmethod driver/execute-reducible-query :oceanbase
   [driver query context respond]
   ((get-method driver/execute-reducible-query :sql-jdbc) driver query context respond))
 
-(log/info "OceanBase driver loaded. Supports both MySQL and Oracle compatibility modes with automatic detection and caching. Connection parameters optimized for stability.")
+(defmethod sql.qp/apply-top-level-clause [:oceanbase :limit]
+  [driver _ honeysql-query {value :limit}]
+  {:pre [(number? value)]}
+  (letfn [(oracle-limit [query val]
+            {:select [:*]
+             :from   [(-> (merge {:select [:*]} query)
+                         (update :select sql.u/select-clause-deduplicate-aliases))]
+             :where  [:<= [:raw "rownum"] [:inline val]]})]
+    (try
+      (let [spec (sql-jdbc.conn/connection-details->spec driver {})
+            mode (get-mode spec)]
+        (case (clojure.string/lower-case mode)
+          "mysql" (sql.helpers/limit honeysql-query [:inline value])
+          (oracle-limit honeysql-query value)))
+      (catch Exception e
+        (log/warn "Error determining OceanBase mode for limit, defaulting to Oracle mode. Error:" (.getMessage e))
+        (oracle-limit honeysql-query value)))))
+
+(defmethod driver/notify-database-updated :oceanbase
+  [_ _]
+  (log/debug "OceanBase database updated notification received"))
+
+(defmethod sql-jdbc.sync.interface/have-select-privilege? :oceanbase
+  [driver ^Connection conn table-schema table-name]
+  (try
+    (let [mode (clojure.string/lower-case (detect-mode-from-connection conn))
+          test-spec {:connection conn}]
+      (case mode
+        "oracle"
+        (try
+          ;; For Oracle mode, try a simple SELECT query
+          (let [sql "SELECT 1 FROM DUAL WHERE 1 = 0"]
+            (jdbc/query test-spec [sql] {:as-arrays? false :max-rows 1})
+            true)
+          (catch Exception e
+            (log/debug "OceanBase Oracle mode: SELECT privilege check failed for" table-schema "." table-name "Error:" (.getMessage e))
+            false))
+        "mysql"
+        (try
+          ;; For MySQL mode, try a simple SELECT query
+          (let [sql "SELECT 1 LIMIT 0"]
+            (jdbc/query test-spec [sql] {:as-arrays? false :max-rows 1})
+            true)
+          (catch Exception e
+            (log/debug "OceanBase MySQL mode: SELECT privilege check failed for" table-schema "." table-name "Error:" (.getMessage e))
+            false))
+        true))
+    (catch Exception e
+      (log/debug "OceanBase: SELECT privilege check failed for" table-schema "." table-name "Error:" (.getMessage e))
+      false)))
+
+(log/info "OceanBase driver loaded")
+(defmethod driver/describe-table :oceanbase
+  [driver database table]
+  (sql-jdbc.execute/do-with-connection-with-options
+   driver
+   database
+   nil
+   (fn [^Connection conn]
+     (let [table-name (:name table)
+           schema (:schema table)]
+       (log/info "OceanBase describe-table for table:" table-name "schema:" schema)
+       (let [result (assoc (select-keys table [:name :schema])
+                           :fields (try
+                                     (let [fields (into #{} (sql-jdbc.sync/describe-fields driver database
+                                                                                          :table-names [table-name]
+                                                                                          :schema-names (when schema [schema])))]
+                                       (log/info "OceanBase describe-fields returned" (count fields) "fields for table" table-name)
+                                       (log/debug "OceanBase describe-fields result:" fields)
+                                       fields)
+                                     (catch Throwable e
+                                       (log/error e "Error retrieving fields for OceanBase table" schema "." table-name)
+                                       (try
+                                         (let [fallback-fields (sql-jdbc.describe-table/describe-table-fields driver conn table nil)]
+                                           (log/info "OceanBase fallback JDBC method returned" (count fallback-fields) "fields for table" table-name)
+                                           (log/debug "OceanBase fallback JDBC result:" fallback-fields)
+                                           fallback-fields)
+                                         (catch Throwable e2
+                                           (log/error e2 "Fallback JDBC method also failed for OceanBase table" schema "." table-name)
+                                           #{})))))]
+         (log/info "OceanBase describe-table final result for table" table-name ":" (select-keys result [:name :schema :fields]))
+         result)))))
+

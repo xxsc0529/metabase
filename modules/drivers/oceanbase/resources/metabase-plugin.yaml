@@ -21,11 +21,6 @@ driver:
           required: true
     - user
     - password
-    - cloud-ip-address-info
-    - ssl
-    - ssh-tunnel
-    - advanced-options-start
-    - default-advanced-options
 init:
   - step: load-namespace
     namespace: metabase.driver.oceanbase
