@@ -212,14 +212,24 @@
   [_]
   (->>
    [driver.common/default-host-details
+<<<<<<< HEAD
     (assoc driver.common/default-port-details :placeholder 2881)
+=======
+    (assoc driver.common/default-port-details
+           :placeholder 2881
+           :helper-text "Port number (default: 2881)")
+>>>>>>> origin/master
     driver.common/default-dbname-details
     driver.common/default-user-details
     driver.common/default-password-details
     driver.common/default-role-details
     driver.common/advanced-options-start
     (assoc driver.common/additional-options
+<<<<<<< HEAD
            :placeholder  "useUnicode=true&characterEncoding=UTF-8&autoReconnect=true")
+=======
+           :placeholder "useUnicode=true&characterEncoding=UTF-8&autoReconnect=true")
+>>>>>>> origin/master
     driver.common/default-advanced-options]
    (into [] (mapcat u/one-or-many))))
 
@@ -336,6 +346,7 @@
 
 (defmethod driver/humanize-connection-error-message :oceanbase
   [_ message]
+<<<<<<< HEAD
   (condp re-matches message
     #"^Communications link failure\s+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.$"
     :cannot-connect-check-host-and-port
@@ -350,6 +361,23 @@
     :invalid-hostname
 
     message))
+=======
+  (let [message-str (str message)]
+    (cond
+      (re-matches #"^Communications link failure\s+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.$" message-str)
+      :cannot-connect-check-host-and-port
+
+      (re-matches #"^Unknown database .*$" message-str)
+      :database-name-incorrect
+
+      (re-matches #"Access denied for user.*$" message-str)
+      :username-or-password-incorrect
+
+      (re-matches #"Must specify port after ':' in connection string" message-str)
+      :invalid-hostname
+
+      :else message)))
+>>>>>>> origin/master
 
 (defmethod sql-jdbc.sync/excluded-schemas :oceanbase
   [_]
@@ -643,12 +671,58 @@
        (log/info "OceanBase describe-table for table:" table-name "schema:" schema)
        (let [result (assoc (select-keys table [:name :schema])
                            :fields (try
+<<<<<<< HEAD
                                      (let [fields (into #{} (sql-jdbc.sync/describe-fields driver database
                                                                                           :table-names [table-name]
                                                                                           :schema-names (when schema [schema])))]
                                        (log/info "OceanBase describe-fields returned" (count fields) "fields for table" table-name)
                                        (log/debug "OceanBase describe-fields result:" fields)
                                        fields)
+=======
+                                     ;; First, try to detect the mode for this specific connection
+                                     (let [mode (detect-mode-from-connection conn)
+                                           _ (log/info "OceanBase detected mode for table" table-name ":" mode)]
+                                       (if (= (clojure.string/lower-case mode) "mysql")
+                                         ;; For MySQL mode, try a direct JDBC approach first
+                                         (try
+                                           (let [db-name (or (:dbname (:details database)) (:db (:details database)))
+                                                 sql "SELECT COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_COMMENT, EXTRA
+                                                       FROM INFORMATION_SCHEMA.COLUMNS
+                                                       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+                                                       ORDER BY ORDINAL_POSITION"
+                                                 params (if db-name [db-name table-name] [table-name])
+                                                 sql (if db-name sql "SELECT COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_COMMENT, EXTRA
+                                                                    FROM INFORMATION_SCHEMA.COLUMNS
+                                                                    WHERE TABLE_NAME = ?
+                                                                    ORDER BY ORDINAL_POSITION")
+                                                 result (jdbc/query {:connection conn} [sql params] {:as-arrays? false})]
+                                             (log/info "OceanBase MySQL direct query returned" (count result) "fields for table" table-name)
+                                             (log/debug "OceanBase MySQL direct query result:" result)
+                                             (into #{} (map (fn [row]
+                                                             {:name (:column_name row)
+                                                              :database-type (:data_type row)
+                                                              :database-position (dec (:ordinal_position row))
+                                                              :database-required (= "NO" (:is_nullable row))
+                                                              :database-is-auto-increment (= "auto_increment" (:extra row))
+                                                              :pk? (= "PRI" (:column_key row))
+                                                              :field-comment (:column_comment row)})
+                                                           result)))
+                                           (catch Exception e
+                                             (log/warn "OceanBase MySQL direct query failed, trying standard method. Error:" (.getMessage e))
+                                             (let [fields (into #{} (sql-jdbc.sync/describe-fields driver database
+                                                                                                  :table-names [table-name]
+                                                                                                  :schema-names (when schema [schema])))]
+                                               (log/info "OceanBase standard describe-fields returned" (count fields) "fields for table" table-name)
+                                               (log/debug "OceanBase standard describe-fields result:" fields)
+                                               fields)))
+                                         ;; For Oracle mode, use standard method
+                                         (let [fields (into #{} (sql-jdbc.sync/describe-fields driver database
+                                                                                              :table-names [table-name]
+                                                                                              :schema-names (when schema [schema])))]
+                                           (log/info "OceanBase Oracle describe-fields returned" (count fields) "fields for table" table-name)
+                                           (log/debug "OceanBase Oracle describe-fields result:" fields)
+                                           fields)))
+>>>>>>> origin/master
                                      (catch Throwable e
                                        (log/error e "Error retrieving fields for OceanBase table" schema "." table-name)
                                        (try
